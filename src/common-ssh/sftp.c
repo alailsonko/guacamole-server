@@ -34,6 +34,57 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * Buffered upload improvements:
+ * Guacamole's original SFTP upload handler wrote each incoming blob directly
+ * via libssh2_sftp_write(), acknowledging only after the write completed.
+ * This can severely limit throughput due to small blob sizes and per-write
+ * round trips within the SSH/SFTP layer. We introduce a per-stream buffering
+ * layer allowing fast ACKs (after data is copied into memory) and deferring
+ * libssh2 writes until the buffer is full or the stream ends.
+ */
+
+#define GUAC_COMMON_SSH_SFTP_UPLOAD_BUFFER_SIZE (128 * 1024) /* 128KB buffer */
+
+typedef struct guac_common_ssh_sftp_upload_state {
+    LIBSSH2_SFTP_HANDLE* file;            /* Underlying SFTP file handle */
+    char                 buffer[GUAC_COMMON_SSH_SFTP_UPLOAD_BUFFER_SIZE];
+    int                  buffered_length; /* Bytes currently buffered */
+    int                  error;           /* Non-zero if a write error occurred */
+} guac_common_ssh_sftp_upload_state;
+
+/**
+ * Flushes any buffered upload data to the remote SFTP file. Partial writes
+ * are retried until complete or an error occurs. On error, the state is
+ * marked so that subsequent blobs can report failure.
+ */
+static void guac_common_ssh_sftp_upload_flush(guac_user* user,
+        guac_stream* stream, guac_common_ssh_sftp_upload_state* state) {
+
+    if (state->error || state->buffered_length <= 0 || state->file == NULL)
+        return;
+
+    int offset = 0;
+    while (offset < state->buffered_length) {
+        ssize_t written = libssh2_sftp_write(state->file,
+                state->buffer + offset, state->buffered_length - offset);
+        if (written <= 0) {
+            guac_user_log(user, GUAC_LOG_INFO,
+                    "Buffered SFTP write failed after %d bytes (attempt returned %zd)",
+                    offset, written);
+            state->error = 1;
+            break;
+        }
+        offset += (int)written;
+    }
+
+    if (!state->error)
+        guac_user_log(user, GUAC_LOG_DEBUG,
+                "Flushed %d buffered bytes to remote file", state->buffered_length);
+
+    state->buffered_length = 0;
+}
+
 int guac_common_ssh_sftp_normalize_path(char* fullpath,
         const char* path) {
 
@@ -307,26 +358,51 @@ static int guac_ssh_append_path(char* fullpath, const char* path_a,
  */
 static int guac_common_ssh_sftp_blob_handler(guac_user* user,
         guac_stream* stream, void* data, int length) {
+    guac_common_ssh_sftp_upload_state* state =
+            (guac_common_ssh_sftp_upload_state*) stream->data;
 
-    /* Pull file from stream */
-    LIBSSH2_SFTP_HANDLE* file = (LIBSSH2_SFTP_HANDLE*) stream->data;
-
-    /* Attempt write */
-    if (libssh2_sftp_write(file, data, length) == length) {
-        guac_user_log(user, GUAC_LOG_DEBUG, "%i bytes written", length);
-        guac_protocol_send_ack(user->socket, stream, "SFTP: OK",
-                GUAC_PROTOCOL_STATUS_SUCCESS);
-        guac_socket_flush(user->socket);
-    }
-
-    /* Inform of any errors */
-    else {
-        guac_user_log(user, GUAC_LOG_INFO, "Unable to write to file");
-        guac_protocol_send_ack(user->socket, stream, "SFTP: Write failed",
+    if (state == NULL) {
+        guac_protocol_send_ack(user->socket, stream, "SFTP: Invalid state",
                 GUAC_PROTOCOL_STATUS_SERVER_ERROR);
         guac_socket_flush(user->socket);
+        return 0;
     }
 
+    /* If previous flush failed, report failure immediately */
+    if (state->error) {
+        guac_protocol_send_ack(user->socket, stream, "SFTP: Previous write failed",
+                GUAC_PROTOCOL_STATUS_SERVER_ERROR);
+        guac_socket_flush(user->socket);
+        return 0;
+    }
+
+    const char* incoming = (const char*) data;
+    int remaining = length;
+    while (remaining > 0 && !state->error) {
+        int space = GUAC_COMMON_SSH_SFTP_UPLOAD_BUFFER_SIZE - state->buffered_length;
+        if (space == 0) {
+            /* Buffer full – flush before adding more */
+            guac_common_ssh_sftp_upload_flush(user, stream, state);
+            space = GUAC_COMMON_SSH_SFTP_UPLOAD_BUFFER_SIZE - state->buffered_length;
+            if (space == 0) break; /* Should not happen */
+        }
+        int to_copy = remaining < space ? remaining : space;
+        memcpy(state->buffer + state->buffered_length, incoming, to_copy);
+        state->buffered_length += to_copy;
+        incoming += to_copy;
+        remaining -= to_copy;
+    }
+
+    /* ACK immediately after buffering (fast path) */
+    if (!state->error) {
+        guac_protocol_send_ack(user->socket, stream, "SFTP: OK",
+                GUAC_PROTOCOL_STATUS_SUCCESS);
+    }
+    else {
+        guac_protocol_send_ack(user->socket, stream, "SFTP: Write failed",
+                GUAC_PROTOCOL_STATUS_SERVER_ERROR);
+    }
+    guac_socket_flush(user->socket);
     return 0;
 
 }
@@ -348,24 +424,47 @@ static int guac_common_ssh_sftp_blob_handler(guac_user* user,
  */
 static int guac_common_ssh_sftp_end_handler(guac_user* user,
         guac_stream* stream) {
+    guac_common_ssh_sftp_upload_state* state =
+            (guac_common_ssh_sftp_upload_state*) stream->data;
 
-    /* Pull file from stream */
-    LIBSSH2_SFTP_HANDLE* file = (LIBSSH2_SFTP_HANDLE*) stream->data;
-
-    /* Attempt to close file */
-    if (libssh2_sftp_close(file) == 0) {
-        guac_user_log(user, GUAC_LOG_DEBUG, "File closed");
-        guac_protocol_send_ack(user->socket, stream, "SFTP: OK",
-                GUAC_PROTOCOL_STATUS_SUCCESS);
-        guac_socket_flush(user->socket);
-    }
-    else {
-        guac_user_log(user, GUAC_LOG_INFO, "Unable to close file");
-        guac_protocol_send_ack(user->socket, stream, "SFTP: Close failed",
+    if (state == NULL) {
+        guac_protocol_send_ack(user->socket, stream, "SFTP: Invalid state",
                 GUAC_PROTOCOL_STATUS_SERVER_ERROR);
         guac_socket_flush(user->socket);
+        return 0;
     }
 
+    /* Flush any remaining buffered data */
+    guac_common_ssh_sftp_upload_flush(user, stream, state);
+
+    int close_ok = 0;
+    if (state->file != NULL && !state->error) {
+        if (libssh2_sftp_close(state->file) == 0) {
+            guac_user_log(user, GUAC_LOG_DEBUG, "File closed");
+            close_ok = 1;
+        }
+        else {
+            guac_user_log(user, GUAC_LOG_INFO, "Unable to close file");
+        }
+    }
+
+    if (close_ok && !state->error) {
+        guac_protocol_send_ack(user->socket, stream, "SFTP: OK",
+                GUAC_PROTOCOL_STATUS_SUCCESS);
+    }
+    else if (state->error) {
+        guac_protocol_send_ack(user->socket, stream, "SFTP: Write failed (flush)",
+                GUAC_PROTOCOL_STATUS_SERVER_ERROR);
+    }
+    else {
+        guac_protocol_send_ack(user->socket, stream, "SFTP: Close failed",
+                GUAC_PROTOCOL_STATUS_SERVER_ERROR);
+    }
+    guac_socket_flush(user->socket);
+
+    /* Free state */
+    guac_mem_free(state);
+    stream->data = NULL;
     return 0;
 
 }
@@ -406,8 +505,8 @@ int guac_common_ssh_sftp_handle_file_stream(
         return 0;
     }
 
-    /* Open file via SFTP */
-    file = libssh2_sftp_open(filesystem->sftp_session, fullpath,
+        /* Open file via SFTP */
+        file = libssh2_sftp_open(filesystem->sftp_session, fullpath,
             LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC,
             S_IRUSR | S_IWUSR);
 
@@ -434,8 +533,13 @@ int guac_common_ssh_sftp_handle_file_stream(
     stream->blob_handler = guac_common_ssh_sftp_blob_handler;
     stream->end_handler = guac_common_ssh_sftp_end_handler;
 
-    /* Store file within stream */
-    stream->data = file;
+    /* Allocate and initialize upload state */
+    guac_common_ssh_sftp_upload_state* state =
+            guac_mem_alloc(sizeof(guac_common_ssh_sftp_upload_state));
+    state->file = file;
+    state->buffered_length = 0;
+    state->error = (file == NULL) ? 1 : 0; /* Mark error if file open failed */
+    stream->data = state;
     return 0;
 
 }
@@ -917,8 +1021,13 @@ static int guac_common_ssh_sftp_put_handler(guac_user* user,
     stream->blob_handler = guac_common_ssh_sftp_blob_handler;
     stream->end_handler = guac_common_ssh_sftp_end_handler;
 
-    /* Store file within stream */
-    stream->data = file;
+    /* Allocate and initialize upload state */
+    guac_common_ssh_sftp_upload_state* state =
+            guac_mem_alloc(sizeof(guac_common_ssh_sftp_upload_state));
+    state->file = file;
+    state->buffered_length = 0;
+    state->error = (file == NULL) ? 1 : 0;
+    stream->data = state;
 
     guac_socket_flush(user->socket);
     return 0;
