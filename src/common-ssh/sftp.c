@@ -44,7 +44,7 @@
  * libssh2 writes until the buffer is full or the stream ends.
  */
 
-#define GUAC_COMMON_SSH_SFTP_UPLOAD_BUFFER_SIZE (128 * 1024) /* 128KB buffer */
+#define GUAC_COMMON_SSH_SFTP_UPLOAD_BUFFER_SIZE (32 * 1024) /* 32KB buffer */
 
 typedef struct guac_common_ssh_sftp_upload_state {
     LIBSSH2_SFTP_HANDLE* file;            /* Underlying SFTP file handle */
