@@ -35,31 +35,42 @@
 #include <string.h>
 
 /*
- * Buffered upload improvements:
- * Guacamole's original SFTP upload handler wrote each incoming blob directly
- * via libssh2_sftp_write(), acknowledging only after the write completed.
- * This can severely limit throughput due to small blob sizes and per-write
- * round trips within the SSH/SFTP layer. We introduce a per-stream buffering
- * layer allowing fast ACKs (after data is copied into memory) and deferring
- * libssh2 writes until the buffer is full or the stream ends.
+ * Size of the per-upload buffer, in bytes.
+ *
+ * SFTP packets carry up to 32KB of payload, but libssh2_sftp_write() can
+ * accept larger buffers and will internally split them across multiple SFTP
+ * packets.
  */
-
-#define GUAC_COMMON_SSH_SFTP_UPLOAD_BUFFER_SIZE (32 * 1024) /* 32KB buffer */
+#define GUAC_COMMON_SSH_SFTP_UPLOAD_BUFFER_SIZE (256 * 1024)
 
 typedef struct guac_common_ssh_sftp_upload_state {
     LIBSSH2_SFTP_HANDLE* file;            /* Underlying SFTP file handle */
-    char                 buffer[GUAC_COMMON_SSH_SFTP_UPLOAD_BUFFER_SIZE];
+    char                 buffer[GUAC_COMMON_SSH_SFTP_UPLOAD_BUFFER_SIZE]; /* Buffered upload data */
     int                  buffered_length; /* Bytes currently buffered */
     int                  error;           /* Non-zero if a write error occurred */
 } guac_common_ssh_sftp_upload_state;
 
 /**
- * Flushes any buffered upload data to the remote SFTP file. Partial writes
- * are retried until complete or an error occurs. On error, the state is
- * marked so that subsequent blobs can report failure.
+ * Flushes any buffered upload data to the remote SFTP file.
+ *
+ * Partial writes are retried until complete or an error occurs. On error, the
+ * upload state is marked so that subsequent blobs can report failure.
+ *
+ * NOTE: libssh2_sftp_write() may return a short count even when no error has
+ * occurred. A short return is still progress. Continue calling until the
+ * entire buffer has been consumed before reusing or modifying it.
+ *
+ * @param user
+ *     The user receiving the upload.
+ *
+ * @param state
+ *     Per-stream upload state containing the SFTP handle and buffered data.
+ *
+ * @return
+ *     Nothing.
  */
 static void guac_common_ssh_sftp_upload_flush(guac_user* user,
-        guac_stream* stream, guac_common_ssh_sftp_upload_state* state) {
+    guac_common_ssh_sftp_upload_state* state) {
 
     if (state->error || state->buffered_length <= 0 || state->file == NULL)
         return;
@@ -362,6 +373,7 @@ static int guac_common_ssh_sftp_blob_handler(guac_user* user,
             (guac_common_ssh_sftp_upload_state*) stream->data;
 
     if (state == NULL) {
+        guac_user_log(user, GUAC_LOG_WARNING, "SFTP upload blob received with missing state");
         guac_protocol_send_ack(user->socket, stream, "SFTP: Invalid state",
                 GUAC_PROTOCOL_STATUS_SERVER_ERROR);
         guac_socket_flush(user->socket);
@@ -370,6 +382,7 @@ static int guac_common_ssh_sftp_blob_handler(guac_user* user,
 
     /* If previous flush failed, report failure immediately */
     if (state->error) {
+        guac_user_log(user, GUAC_LOG_WARNING, "SFTP upload blob received after previous write failure");
         guac_protocol_send_ack(user->socket, stream, "SFTP: Previous write failed",
                 GUAC_PROTOCOL_STATUS_SERVER_ERROR);
         guac_socket_flush(user->socket);
@@ -378,15 +391,29 @@ static int guac_common_ssh_sftp_blob_handler(guac_user* user,
 
     const char* incoming = (const char*) data;
     int remaining = length;
+
+    /*
+     * Copy the incoming blob into the upload buffer. We always flush when the
+     * buffer is full so that subsequent blobs start with space available and
+     * the buffer can be reused without reallocations.
+     */
     while (remaining > 0 && !state->error) {
-        int space = GUAC_COMMON_SSH_SFTP_UPLOAD_BUFFER_SIZE - state->buffered_length;
-        if (space == 0) {
-            /* Buffer full – flush before adding more */
-            guac_common_ssh_sftp_upload_flush(user, stream, state);
-            space = GUAC_COMMON_SSH_SFTP_UPLOAD_BUFFER_SIZE - state->buffered_length;
-            if (space == 0) break; /* Should not happen */
+        /* If the buffer is already full, flush before copying more data. */
+        if (state->buffered_length == GUAC_COMMON_SSH_SFTP_UPLOAD_BUFFER_SIZE) {
+            guac_common_ssh_sftp_upload_flush(user, state);
+            /* Defensive: bail if error occurred during flush. */
+            if (state->error)
+                break;
+
+            /* Defensive: bail if flush did not reset buffered_length. */
+            if (state->buffered_length == GUAC_COMMON_SSH_SFTP_UPLOAD_BUFFER_SIZE)
+                break;
         }
+
+        /* Copy as much of the remaining blob as will fit in the buffer. */
+        int space = GUAC_COMMON_SSH_SFTP_UPLOAD_BUFFER_SIZE - state->buffered_length;
         int to_copy = remaining < space ? remaining : space;
+
         memcpy(state->buffer + state->buffered_length, incoming, to_copy);
         state->buffered_length += to_copy;
         incoming += to_copy;
@@ -395,10 +422,12 @@ static int guac_common_ssh_sftp_blob_handler(guac_user* user,
 
     /* ACK immediately after buffering (fast path) */
     if (!state->error) {
+        guac_user_log(user, GUAC_LOG_DEBUG, "SFTP upload buffered %d bytes (ack success)", length);
         guac_protocol_send_ack(user->socket, stream, "SFTP: OK",
                 GUAC_PROTOCOL_STATUS_SUCCESS);
     }
     else {
+        guac_user_log(user, GUAC_LOG_WARNING, "SFTP upload blob failed after buffering attempt");
         guac_protocol_send_ack(user->socket, stream, "SFTP: Write failed",
                 GUAC_PROTOCOL_STATUS_SERVER_ERROR);
     }
@@ -435,7 +464,7 @@ static int guac_common_ssh_sftp_end_handler(guac_user* user,
     }
 
     /* Flush any remaining buffered data */
-    guac_common_ssh_sftp_upload_flush(user, stream, state);
+    guac_common_ssh_sftp_upload_flush(user, state);
 
     int close_ok = 0;
     if (state->file != NULL && !state->error) {
